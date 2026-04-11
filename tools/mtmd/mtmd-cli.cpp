@@ -428,9 +428,16 @@ static size_t ffmpeg_load_video_media(mtmd_context * ctx, const std::string & fn
     }
     if (mtmd_support_audio(ctx)) {
         const int sample_rate = mtmd_get_audio_bitrate(ctx);
+        const int chunk_len = mtmd_get_audio_chunk_len(ctx);
         if (sample_rate > 0) {
             std::vector<float> pcmf32;
             if (ffmpeg_decode_audio_samples(fname, sample_rate, pcmf32)) {
+                if (chunk_len > 0) {
+                    const size_t max_samples = (size_t) sample_rate * (size_t) chunk_len;
+                    if (pcmf32.size() > max_samples) {
+                        pcmf32.resize(max_samples);
+                    }
+                }
                 mtmd::bitmap bmp(mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data()));
                 if (bmp.ptr) {
                     bmp.set_id((fname + "#audio").c_str());

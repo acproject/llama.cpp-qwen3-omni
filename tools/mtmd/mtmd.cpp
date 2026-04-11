@@ -897,6 +897,13 @@ int mtmd_get_audio_bitrate(mtmd_context * ctx) {
     return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;
 }
 
+int mtmd_get_audio_chunk_len(mtmd_context * ctx) {
+    if (!ctx->ctx_a) {
+        return -1;
+    }
+    return clip_get_hparams(ctx->ctx_a)->audio_chunk_len;
+}
+
 //
 // public API functions
 //
