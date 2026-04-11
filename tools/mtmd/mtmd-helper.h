@@ -93,4 +93,10 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
 // C++ wrappers
 //
 
+#ifdef __cplusplus
+namespace mtmd {
+MTMD_API size_t helper_bitmaps_append_from_file(mtmd_context * ctx, const char * fname, bitmaps & out);
+}
+#endif
+
 #endif

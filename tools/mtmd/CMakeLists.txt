@@ -49,6 +49,20 @@ target_include_directories(mtmd PRIVATE ../../src)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
+find_package(PkgConfig QUIET)
+if (PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+        libavformat
+        libavcodec
+        libavutil
+        libswscale
+        libswresample)
+    if (TARGET PkgConfig::FFMPEG)
+        target_link_libraries(mtmd PRIVATE PkgConfig::FFMPEG)
+        target_compile_definitions(mtmd PUBLIC LLAMA_MTMD_FFMPEG)
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties     (mtmd PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(mtmd PRIVATE LLAMA_BUILD)
@@ -99,17 +113,6 @@ if(LLAMA_TOOLS_INSTALL)
 endif()
 target_link_libraries  (${TARGET} PRIVATE common mtmd Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
-
-find_package(PkgConfig QUIET)
-if (PkgConfig_FOUND)
-    pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
-        libavformat
-        libavcodec
-        libavutil
-        libswscale
-        libswresample)
-    if (TARGET PkgConfig::FFMPEG)
-        target_link_libraries(${TARGET} PRIVATE PkgConfig::FFMPEG)
-        target_compile_definitions(${TARGET} PRIVATE LLAMA_MTMD_FFMPEG)
-    endif()
+if (TARGET PkgConfig::FFMPEG)
+    target_link_libraries(${TARGET} PRIVATE PkgConfig::FFMPEG)
 endif()

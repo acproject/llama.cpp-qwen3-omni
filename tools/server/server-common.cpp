@@ -633,10 +633,36 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+static const std::string mtmd_video_marker_placeholder = "<__video__>";
+
+static bool replace_first(std::string & text, const std::string & what, const std::string & with) {
+    const size_t pos = text.find(what);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    text.replace(pos, what.size(), with);
+    return true;
+}
+
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<server_media> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+        if (file.kind == server_media_kind::video_file) {
+            const size_t n_loaded = mtmd::helper_bitmaps_append_from_file(mctx, file.path.c_str(), bitmaps);
+            if (n_loaded == 0) {
+                throw std::runtime_error("Failed to load video file");
+            }
+            std::string markers;
+            for (size_t i = 0; i < n_loaded; ++i) {
+                markers += mtmd_default_marker();
+            }
+            if (!replace_first(prompt, mtmd_video_marker_placeholder, markers)) {
+                throw std::runtime_error("Failed to map video input to prompt markers");
+            }
+            continue;
+        }
+
+        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data.data(), file.data.size()));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
         }
@@ -695,9 +721,11 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
                 throw std::runtime_error("Multimodal data provided, but model does not support multimodal requests.");
 
             // JSON object with prompt and multimodal key.
-            std::vector<raw_buffer> files;
+            std::vector<server_media> files;
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                server_media media;
+                media.data = base64_decode(entry);
+                files.push_back(std::move(media));
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
         } else {
@@ -771,7 +799,7 @@ json oaicompat_completion_params_parse(const json & body) {
 
 // media_path always end with '/', see arg.cpp
 static void handle_media(
-        std::vector<raw_buffer> & out_files,
+        std::vector<server_media> & out_files,
         json & media_obj,
         const std::string & media_path) {
     std::string url = json_value(media_obj, "url", std::string());
@@ -786,9 +814,9 @@ static void handle_media(
         auto res = common_remote_get_content(url, params);
         if (200 <= res.first && res.first < 300) {
             SRV_INF("downloaded %zu bytes\n", res.second.size());
-            raw_buffer data;
-            data.insert(data.end(), res.second.begin(), res.second.end());
-            out_files.push_back(data);
+            server_media media;
+            media.data.insert(media.data.end(), res.second.begin(), res.second.end());
+            out_files.push_back(std::move(media));
         } else {
             throw std::runtime_error("Failed to download image");
         }
@@ -799,7 +827,6 @@ static void handle_media(
         }
         // load local image file
         std::string file_path = url.substr(7); // remove "file://"
-        raw_buffer data;
         if (!fs_validate_filename(file_path, true)) {
             throw std::invalid_argument("file path is not allowed: " + file_path);
         }
@@ -808,8 +835,9 @@ static void handle_media(
         if (!file) {
             throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
         }
-        data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        out_files.push_back(data);
+        server_media media;
+        media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        out_files.push_back(std::move(media));
 
     } else {
         // try to decode base64 image
@@ -823,7 +851,9 @@ static void handle_media(
         } else {
             auto base64_data = parts[1];
             auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
+            server_media media;
+            media.data = std::move(decoded_data);
+            out_files.push_back(std::move(media));
         }
     }
 }

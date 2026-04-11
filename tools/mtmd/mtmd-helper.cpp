@@ -13,6 +13,9 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
+#include <memory>
+#include <string>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
@@ -31,6 +34,17 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
+
+#ifdef LLAMA_MTMD_FFMPEG
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+}
+#endif
 
 #ifdef MTMD_INTERNAL_HEADER
 #error "mtmd-helper is a public library outside of mtmd. it must not include internal headers"
@@ -467,6 +481,369 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 
 } // namespace audio_helpers
 
+#ifdef LLAMA_MTMD_FFMPEG
+namespace video_helpers {
+
+struct avformat_input_deleter {
+    void operator()(AVFormatContext * ctx) const {
+        if (ctx != nullptr) {
+            avformat_close_input(&ctx);
+        }
+    }
+};
+
+struct avcodec_context_deleter {
+    void operator()(AVCodecContext * ctx) const {
+        avcodec_free_context(&ctx);
+    }
+};
+
+struct avframe_deleter {
+    void operator()(AVFrame * frame) const {
+        av_frame_free(&frame);
+    }
+};
+
+struct avpacket_deleter {
+    void operator()(AVPacket * packet) const {
+        av_packet_free(&packet);
+    }
+};
+
+struct swscale_context_deleter {
+    void operator()(SwsContext * ctx) const {
+        sws_freeContext(ctx);
+    }
+};
+
+struct swresample_context_deleter {
+    void operator()(SwrContext * ctx) const {
+        swr_free(&ctx);
+    }
+};
+
+using avformat_input_ptr = std::unique_ptr<AVFormatContext, avformat_input_deleter>;
+using avcodec_context_ptr = std::unique_ptr<AVCodecContext, avcodec_context_deleter>;
+using avframe_ptr = std::unique_ptr<AVFrame, avframe_deleter>;
+using avpacket_ptr = std::unique_ptr<AVPacket, avpacket_deleter>;
+using swscale_context_ptr = std::unique_ptr<SwsContext, swscale_context_deleter>;
+using swresample_context_ptr = std::unique_ptr<SwrContext, swresample_context_deleter>;
+
+double stream_duration_seconds(const AVFormatContext * fmt_ctx, const AVStream * stream) {
+    if (stream->duration > 0) {
+        return stream->duration * av_q2d(stream->time_base);
+    }
+    if (fmt_ctx->duration > 0) {
+        return fmt_ctx->duration / (double) AV_TIME_BASE;
+    }
+    return 0.0;
+}
+
+double frame_timestamp_seconds(const AVFrame * frame, const AVStream * stream, int64_t decoded_index) {
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        return frame->best_effort_timestamp * av_q2d(stream->time_base);
+    }
+    AVRational fps = stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+    if (fps.num > 0 && fps.den > 0) {
+        return decoded_index / av_q2d(fps);
+    }
+    return (double) decoded_index;
+}
+
+bool add_rgb_frame(mtmd::bitmaps & bitmaps, SwsContext * sws_ctx, AVFrame * src_frame, const std::string & fname, size_t frame_idx) {
+    const int width = src_frame->width;
+    const int height = src_frame->height;
+    const int rgb_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, width, height, 1);
+    if (rgb_buf_size <= 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> rgb_buf(rgb_buf_size);
+    uint8_t * dst_data[4] = { nullptr, nullptr, nullptr, nullptr };
+    int dst_linesize[4] = { 0, 0, 0, 0 };
+    if (av_image_fill_arrays(dst_data, dst_linesize, rgb_buf.data(), AV_PIX_FMT_RGB24, width, height, 1) < 0) {
+        return false;
+    }
+
+    if (sws_scale(sws_ctx, src_frame->data, src_frame->linesize, 0, height, dst_data, dst_linesize) <= 0) {
+        return false;
+    }
+
+    mtmd::bitmap bmp(width, height, rgb_buf.data());
+    bmp.set_id((fname + "#frame-" + std::to_string(frame_idx)).c_str());
+    bitmaps.entries.push_back(std::move(bmp));
+    return true;
+}
+
+size_t decode_video_frames(const std::string & fname, mtmd::bitmaps & bitmaps) {
+    AVFormatContext * raw_fmt_ctx = nullptr;
+    if (avformat_open_input(&raw_fmt_ctx, fname.c_str(), nullptr, nullptr) < 0) {
+        return 0;
+    }
+    avformat_input_ptr fmt_ctx(raw_fmt_ctx);
+    if (avformat_find_stream_info(fmt_ctx.get(), nullptr) < 0) {
+        return 0;
+    }
+
+    const int video_stream_idx = av_find_best_stream(fmt_ctx.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (video_stream_idx < 0) {
+        return 0;
+    }
+
+    AVStream * stream = fmt_ctx->streams[video_stream_idx];
+    const AVCodec * codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (codec == nullptr) {
+        return 0;
+    }
+
+    avcodec_context_ptr codec_ctx(avcodec_alloc_context3(codec));
+    if (!codec_ctx) {
+        return 0;
+    }
+    if (avcodec_parameters_to_context(codec_ctx.get(), stream->codecpar) < 0) {
+        return 0;
+    }
+    if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
+        return 0;
+    }
+
+    swscale_context_ptr sws_ctx(sws_getContext(
+        codec_ctx->width,
+        codec_ctx->height,
+        codec_ctx->pix_fmt,
+        codec_ctx->width,
+        codec_ctx->height,
+        AV_PIX_FMT_RGB24,
+        SWS_BILINEAR,
+        nullptr,
+        nullptr,
+        nullptr));
+    if (!sws_ctx) {
+        return 0;
+    }
+
+    const double duration_sec = stream_duration_seconds(fmt_ctx.get(), stream);
+    const size_t max_frames = 8;
+    size_t target_frames = 1;
+    if (duration_sec > 0.0) {
+        target_frames = std::max<size_t>(1, std::min<size_t>(max_frames, (size_t) std::llround(duration_sec)));
+    }
+    const double sample_interval = target_frames > 1 ? duration_sec / (double) (target_frames - 1) : 0.0;
+    double next_sample = sample_interval;
+
+    avpacket_ptr packet(av_packet_alloc());
+    avframe_ptr frame(av_frame_alloc());
+    if (!packet || !frame) {
+        return 0;
+    }
+
+    size_t loaded = 0;
+    int64_t decoded_index = 0;
+
+    auto handle_frame = [&](AVFrame * cur_frame) {
+        const double ts_sec = frame_timestamp_seconds(cur_frame, stream, decoded_index++);
+        const bool should_take = loaded == 0 || sample_interval <= 0.0 || ts_sec + 1e-6 >= next_sample;
+        if (!should_take) {
+            return true;
+        }
+        if (!add_rgb_frame(bitmaps, sws_ctx.get(), cur_frame, fname, loaded)) {
+            return false;
+        }
+        ++loaded;
+        if (sample_interval > 0.0) {
+            next_sample += sample_interval;
+        }
+        return loaded < target_frames;
+    };
+
+    while (av_read_frame(fmt_ctx.get(), packet.get()) >= 0) {
+        if (packet->stream_index != video_stream_idx) {
+            av_packet_unref(packet.get());
+            continue;
+        }
+        if (avcodec_send_packet(codec_ctx.get(), packet.get()) < 0) {
+            av_packet_unref(packet.get());
+            return loaded;
+        }
+        av_packet_unref(packet.get());
+        while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+            if (!handle_frame(frame.get())) {
+                return loaded;
+            }
+            av_frame_unref(frame.get());
+        }
+    }
+
+    avcodec_send_packet(codec_ctx.get(), nullptr);
+    while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+        if (!handle_frame(frame.get())) {
+            break;
+        }
+        av_frame_unref(frame.get());
+    }
+
+    return loaded;
+}
+
+bool decode_audio_samples(const std::string & fname, int sample_rate, std::vector<float> & pcmf32) {
+    AVFormatContext * raw_fmt_ctx = nullptr;
+    if (avformat_open_input(&raw_fmt_ctx, fname.c_str(), nullptr, nullptr) < 0) {
+        return false;
+    }
+    avformat_input_ptr fmt_ctx(raw_fmt_ctx);
+    if (avformat_find_stream_info(fmt_ctx.get(), nullptr) < 0) {
+        return false;
+    }
+
+    const int audio_stream_idx = av_find_best_stream(fmt_ctx.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audio_stream_idx < 0) {
+        return false;
+    }
+
+    AVStream * stream = fmt_ctx->streams[audio_stream_idx];
+    const AVCodec * codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (codec == nullptr) {
+        return false;
+    }
+
+    avcodec_context_ptr codec_ctx(avcodec_alloc_context3(codec));
+    if (!codec_ctx) {
+        return false;
+    }
+    if (avcodec_parameters_to_context(codec_ctx.get(), stream->codecpar) < 0) {
+        return false;
+    }
+    if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
+        return false;
+    }
+
+    AVChannelLayout out_layout;
+    av_channel_layout_default(&out_layout, 1);
+    SwrContext * raw_swr_ctx = nullptr;
+    if (swr_alloc_set_opts2(
+            &raw_swr_ctx,
+            &out_layout,
+            AV_SAMPLE_FMT_FLT,
+            sample_rate,
+            &codec_ctx->ch_layout,
+            codec_ctx->sample_fmt,
+            codec_ctx->sample_rate,
+            0,
+            nullptr) < 0) {
+        av_channel_layout_uninit(&out_layout);
+        return false;
+    }
+    swresample_context_ptr swr_ctx(raw_swr_ctx);
+    av_channel_layout_uninit(&out_layout);
+    if (!swr_ctx || swr_init(swr_ctx.get()) < 0) {
+        return false;
+    }
+
+    avpacket_ptr packet(av_packet_alloc());
+    avframe_ptr frame(av_frame_alloc());
+    if (!packet || !frame) {
+        return false;
+    }
+
+    auto append_frame = [&](AVFrame * cur_frame) {
+        const int dst_nb_samples = av_rescale_rnd(
+            swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate) + cur_frame->nb_samples,
+            sample_rate,
+            codec_ctx->sample_rate,
+            AV_ROUND_UP);
+        std::vector<float> buffer(dst_nb_samples);
+        std::vector<const uint8_t *> input(cur_frame->ch_layout.nb_channels);
+        for (int i = 0; i < cur_frame->ch_layout.nb_channels; ++i) {
+            input[i] = cur_frame->extended_data[i];
+        }
+        uint8_t * out[] = { reinterpret_cast<uint8_t *>(buffer.data()) };
+        const int out_samples = swr_convert(
+            swr_ctx.get(),
+            out,
+            dst_nb_samples,
+            input.data(),
+            cur_frame->nb_samples);
+        if (out_samples > 0) {
+            pcmf32.insert(pcmf32.end(), buffer.begin(), buffer.begin() + out_samples);
+        }
+        return out_samples >= 0;
+    };
+
+    while (av_read_frame(fmt_ctx.get(), packet.get()) >= 0) {
+        if (packet->stream_index != audio_stream_idx) {
+            av_packet_unref(packet.get());
+            continue;
+        }
+        if (avcodec_send_packet(codec_ctx.get(), packet.get()) < 0) {
+            av_packet_unref(packet.get());
+            return !pcmf32.empty();
+        }
+        av_packet_unref(packet.get());
+        while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+            if (!append_frame(frame.get())) {
+                return !pcmf32.empty();
+            }
+            av_frame_unref(frame.get());
+        }
+    }
+
+    avcodec_send_packet(codec_ctx.get(), nullptr);
+    while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+        if (!append_frame(frame.get())) {
+            return !pcmf32.empty();
+        }
+        av_frame_unref(frame.get());
+    }
+
+    if (swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate) > 0) {
+        const int dst_nb_samples = av_rescale_rnd(
+            swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate),
+            sample_rate,
+            codec_ctx->sample_rate,
+            AV_ROUND_UP);
+        std::vector<float> buffer(dst_nb_samples);
+        uint8_t * out[] = { reinterpret_cast<uint8_t *>(buffer.data()) };
+        const int out_samples = swr_convert(swr_ctx.get(), out, dst_nb_samples, nullptr, 0);
+        if (out_samples > 0) {
+            pcmf32.insert(pcmf32.end(), buffer.begin(), buffer.begin() + out_samples);
+        }
+    }
+
+    return !pcmf32.empty();
+}
+
+size_t append_video_file(mtmd_context * ctx, const std::string & fname, mtmd::bitmaps & out) {
+    size_t loaded = 0;
+    if (mtmd_support_vision(ctx)) {
+        loaded += decode_video_frames(fname, out);
+    }
+    if (mtmd_support_audio(ctx)) {
+        const int sample_rate = mtmd_get_audio_bitrate(ctx);
+        const int chunk_len = mtmd_get_audio_chunk_len(ctx);
+        if (sample_rate > 0) {
+            std::vector<float> pcmf32;
+            if (decode_audio_samples(fname, sample_rate, pcmf32)) {
+                if (chunk_len > 0) {
+                    const size_t max_samples = (size_t) sample_rate * (size_t) chunk_len;
+                    if (pcmf32.size() > max_samples) {
+                        pcmf32.resize(max_samples);
+                    }
+                }
+                mtmd::bitmap bmp(mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data()));
+                if (bmp.ptr) {
+                    bmp.set_id((fname + "#audio").c_str());
+                    out.entries.push_back(std::move(bmp));
+                    ++loaded;
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
+} // namespace video_helpers
+#endif
+
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
@@ -518,4 +895,18 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, const char *
     }
 
     return mtmd_helper_bitmap_init_from_buf(ctx, buf.data(), buf.size());
+}
+
+size_t mtmd::helper_bitmaps_append_from_file(mtmd_context * ctx, const char * fname, mtmd::bitmaps & out) {
+    mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_file(ctx, fname));
+    if (bmp.ptr) {
+        out.entries.push_back(std::move(bmp));
+        return 1;
+    }
+
+#ifdef LLAMA_MTMD_FFMPEG
+    return video_helpers::append_video_file(ctx, fname, out);
+#else
+    return 0;
+#endif
 }

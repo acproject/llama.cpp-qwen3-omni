@@ -31,6 +31,17 @@ using json = nlohmann::ordered_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+enum class server_media_kind {
+    auto_detect,
+    video_file,
+};
+
+struct server_media {
+    raw_buffer data;
+    std::string path;
+    server_media_kind kind = server_media_kind::auto_detect;
+};
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value
@@ -248,7 +259,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<server_media> files);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -285,6 +296,7 @@ struct oaicompat_parser_options {
     common_chat_templates * tmpls;
     bool allow_image;
     bool allow_audio;
+    bool allow_video;
     bool enable_thinking = true;
     std::string media_path;
 };
@@ -293,7 +305,7 @@ struct oaicompat_parser_options {
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const oaicompat_parser_options & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<server_media> & out_files);
 
 // convert Anthropic Messages API format to OpenAI Chat Completions API format
 json convert_anthropic_to_oai(const json & body);

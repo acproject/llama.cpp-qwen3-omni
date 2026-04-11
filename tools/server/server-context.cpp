@@ -843,6 +843,7 @@ private:
             /* common_chat_templates */ chat_templates.get(),
             /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
             /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+            /* allow_video           */ mctx ? (mtmd_support_vision(mctx) || mtmd_support_audio(mctx)) : false,
             /* enable_thinking       */ enable_thinking,
             /* media_path            */ params_base.media_path,
         };
