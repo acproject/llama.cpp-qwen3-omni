@@ -38,7 +38,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
     { LLM_ARCH_QWEN3OMNI_TALKER, "qwen3omni-talker" },
-    { LLM_ARCH_QWEN3OMNIMOE,     "qwen3omnimoe"     },
+    { LLM_ARCH_QWEN3OMNIMOE,     "qwen3omni"     },
     { LLM_ARCH_PHI2,             "phi2"             },
     { LLM_ARCH_PHI3,             "phi3"             },
     { LLM_ARCH_PHIMOE,           "phimoe"           },
@@ -2706,6 +2706,10 @@ const char * llm_arch_name(llm_arch arch) {
 }
 
 llm_arch llm_arch_from_string(const std::string & name) {
+    if (name == "qwen3omnimoe") {
+        return LLM_ARCH_QWEN3OMNIMOE;
+    }
+
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;

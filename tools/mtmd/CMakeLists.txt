@@ -99,3 +99,17 @@ if(LLAMA_TOOLS_INSTALL)
 endif()
 target_link_libraries  (${TARGET} PRIVATE common mtmd Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+find_package(PkgConfig QUIET)
+if (PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+        libavformat
+        libavcodec
+        libavutil
+        libswscale
+        libswresample)
+    if (TARGET PkgConfig::FFMPEG)
+        target_link_libraries(${TARGET} PRIVATE PkgConfig::FFMPEG)
+        target_compile_definitions(${TARGET} PRIVATE LLAMA_MTMD_FFMPEG)
+    endif()
+endif()

@@ -865,6 +865,36 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
+int llama_model_loader::ignore_tensors_with_prefixes(const std::vector<std::string> & prefixes) {
+    int ignored = 0;
+
+    for (auto it = weights_map.begin(); it != weights_map.end();) {
+        bool match = false;
+        for (const auto & prefix : prefixes) {
+            if (it->first.rfind(prefix, 0) == 0) {
+                match = true;
+                break;
+            }
+        }
+
+        if (!match) {
+            ++it;
+            continue;
+        }
+
+        n_elements -= ggml_nelements(it->second.tensor);
+        n_bytes -= ggml_nbytes(it->second.tensor);
+        it = weights_map.erase(it);
+        ++ignored;
+    }
+
+    if (ignored > 0) {
+        n_tensors = weights_map.size();
+    }
+
+    return ignored;
+}
+
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));

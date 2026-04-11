@@ -4265,6 +4265,9 @@ class Qwen3OmniThinkerModel(Qwen3MoeModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        vision_config = self.global_config.get("thinker_config", {}).get("vision_config", {})
+        deepstack_layer_num = len(vision_config.get("deepstack_visual_indexes", []))
+        self.gguf_writer.add_num_deepstack_layers(deepstack_layer_num)
         # Write M-RoPE dimension sections for multimodal [temporal, spatial_y, spatial_x, padding]
         # Padded to 4 elements as expected by llama.cpp
         self.gguf_writer.add_rope_dimension_sections([24, 20, 20, 0])

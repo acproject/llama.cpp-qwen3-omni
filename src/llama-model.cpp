@@ -1160,6 +1160,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             {
                 // Qwen3-Omni Thinker: Qwen3MOE with M-RoPE and shared experts
                 // Qwen3-Omni uses 3 active M-RoPE sections [24, 20, 20, 0] (4th is padding)
+                ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp, false);
                 ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -7018,6 +7019,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %d others) cannot be used with preferred buffer type %s, using %s instead\n",
                 __func__, first_moved_tensor->name, ggml_type_name(first_moved_tensor->type), n_moved_tensors - 1,
                 ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
+        }
+    }
+
+    if (arch == LLM_ARCH_QWEN3OMNIMOE) {
+        const int ignored = ml.ignore_tensors_with_prefixes({"v.", "a.", "mm."});
+        if (ignored > 0) {
+            LLAMA_LOG_WARN("%s: ignoring %d embedded multimodal tensor(s) in Qwen3-Omni thinker GGUF\n", __func__, ignored);
         }
     }
 

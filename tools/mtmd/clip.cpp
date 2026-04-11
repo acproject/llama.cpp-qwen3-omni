@@ -871,6 +871,7 @@ struct clip_model_loader {
 
     bool has_vision = false;
     bool has_audio  = false;
+    bool is_combined_qwen3omni = false;
 
     // TODO @ngxson : we should not pass clip_ctx here, it should be clip_model
     clip_model_loader(const char * fname) : fname(fname) {
@@ -909,6 +910,42 @@ struct clip_model_loader {
         {
             get_bool(KEY_HAS_VISION_ENC, has_vision, false);
             get_bool(KEY_HAS_AUDIO_ENC,  has_audio,  false);
+
+            if (!has_vision && !has_audio) {
+                std::string architecture = "unknown";
+                get_string("general.architecture", architecture, false);
+
+                auto has_tensor_with_prefix = [&](const char * prefix) {
+                    for (ggml_tensor * cur = ggml_get_first_tensor(meta); cur; cur = ggml_get_next_tensor(meta, cur)) {
+                        if (strncmp(cur->name, prefix, strlen(prefix)) == 0) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                if (architecture == "qwen3omni") {
+                    const bool bundled_vision = has_tensor_with_prefix("v.") || has_tensor_with_prefix("mm.");
+                    const bool bundled_audio  = has_tensor_with_prefix("a.") || has_tensor_with_prefix("mm.a.");
+
+                    if (bundled_vision || bundled_audio) {
+                        has_vision = bundled_vision;
+                        has_audio  = bundled_audio;
+                        is_combined_qwen3omni = true;
+                        LOG_WRN("%s: detected bundled Qwen3-Omni GGUF without clip metadata; inferring modalities from tensor prefixes\n", __func__);
+                    } else {
+                        throw std::runtime_error(string_format(
+                            "%s: '%s' looks like a Qwen3-Omni thinker GGUF, but it does not contain embedded multimodal projector tensors. "
+                            "Provide a real mmproj file or a bundled GGUF that includes 'v.', 'a.' and 'mm.' tensors",
+                            __func__, fname));
+                    }
+                } else {
+                    throw std::runtime_error(string_format(
+                        "%s: '%s' is not a valid multimodal projector GGUF (general.architecture=%s). "
+                        "Expected a CLIP/mmproj file with '%s' and/or '%s' metadata",
+                        __func__, fname, architecture.c_str(), KEY_HAS_VISION_ENC, KEY_HAS_AUDIO_ENC));
+                }
+            }
 
             if (has_vision) {
                 LOG_INF("%s: has vision encoder\n", __func__);
@@ -961,6 +998,10 @@ struct clip_model_loader {
                 } else {
                     GGML_ABORT("unknown modality");
                 }
+            }
+
+            if (proj_type.empty() && is_combined_qwen3omni) {
+                proj_type = modality == CLIP_MODALITY_VISION ? "qwen3omni_vision" : "qwen3omni_audio";
             }
 
             model.proj_type = clip_projector_type_from_string(proj_type);
