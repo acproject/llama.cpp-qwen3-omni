@@ -62,6 +62,41 @@ extern std::vector<float> mtmd_code2wav_run(
     bool verbose,
     bool cpu_only);
 
+static bool read_tensor_row_as_float(const ggml_tensor * tensor, int64_t row, int64_t ncols, float * dst) {
+    if (!tensor || !dst || row < 0 || ncols <= 0) {
+        return false;
+    }
+
+    const size_t row_size = ggml_row_size(tensor->type, ncols);
+    const size_t byte_offset = (size_t) row * row_size;
+
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, dst, byte_offset, ncols * sizeof(float));
+        return true;
+    }
+
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> f16_buf(ncols);
+        ggml_backend_tensor_get(tensor, f16_buf.data(), byte_offset, ncols * sizeof(ggml_fp16_t));
+        for (int64_t i = 0; i < ncols; ++i) {
+            dst[i] = ggml_fp16_to_fp32(f16_buf[i]);
+        }
+        return true;
+    }
+
+    if (ggml_is_quantized(tensor->type)) {
+        std::vector<uint8_t> raw(row_size);
+        ggml_backend_tensor_get(tensor, raw.data(), byte_offset, row_size);
+        const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+        if (traits && traits->to_float) {
+            traits->to_float(raw.data(), dst, ncols);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // =============================================================================
 // TTS Context
 // =============================================================================
@@ -701,11 +736,13 @@ mtmd_tts_context * mtmd_tts_init(
         if (tm->tok_embd->type == GGML_TYPE_F32) {
             ggml_backend_tensor_get(tm->tok_embd, ctx->tok_embd_data.data(), 0,
                                     ggml_nbytes(tm->tok_embd));
-        } else if (tm->tok_embd->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> f16_buf(ctx->tok_embd_dim * ctx->tok_embd_vocab);
-            ggml_backend_tensor_get(tm->tok_embd, f16_buf.data(), 0, ggml_nbytes(tm->tok_embd));
-            for (size_t i = 0; i < f16_buf.size(); ++i) {
-                ctx->tok_embd_data[i] = ggml_fp16_to_fp32(f16_buf[i]);
+        } else {
+            for (int64_t row = 0; row < ctx->tok_embd_vocab; ++row) {
+                if (!read_tensor_row_as_float(tm->tok_embd, row, ctx->tok_embd_dim,
+                        ctx->tok_embd_data.data() + row * ctx->tok_embd_dim)) {
+                    fprintf(stderr, "TTS: Unsupported Talker tok_embd type: %d\n", tm->tok_embd->type);
+                    return nullptr;
+                }
             }
         }
     }
@@ -779,18 +816,9 @@ int mtmd_tts_generate(
         proj.resize(n_embd, 0.0f);
 
         if (tm->tok_embd && token_id < (int64_t)tm->tok_embd->ne[1]) {
-            size_t row_offset = (size_t)token_id * n_embd_in;
-            size_t elem_size = ggml_type_size(tm->tok_embd->type);
-            size_t byte_offset = row_offset * elem_size;
-
-            if (tm->tok_embd->type == GGML_TYPE_F32) {
-                ggml_backend_tensor_get(tm->tok_embd, raw.data(), byte_offset, n_embd_in * sizeof(float));
-            } else if (tm->tok_embd->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> f16_buf(n_embd_in);
-                ggml_backend_tensor_get(tm->tok_embd, f16_buf.data(), byte_offset, n_embd_in * sizeof(ggml_fp16_t));
-                for (int i = 0; i < n_embd_in; ++i) {
-                    raw[i] = ggml_fp16_to_fp32(f16_buf[i]);
-                }
+            if (!read_tensor_row_as_float(tm->tok_embd, token_id, n_embd_in, raw.data())) {
+                fprintf(stderr, "TTS: Unsupported thinker tok_embd type: %d\n", tm->tok_embd->type);
+                return;
             }
 
             apply_text_projection(ctx->talker_model, raw.data(), proj.data(), 1, false);
@@ -1160,23 +1188,11 @@ int mtmd_tts_generate_from_text(
     }
 
     std::vector<float> embeddings(n_tokens * n_embd);
-    size_t elem_size = ggml_type_size(tok_embd->type);
-
     for (int t = 0; t < n_tokens; ++t) {
         int token_id = tokens[t];
-        size_t row_offset = (size_t)token_id * n_embd;
-        size_t byte_offset = row_offset * elem_size;
         float * dst = &embeddings[t * n_embd];
 
-        if (tok_embd->type == GGML_TYPE_F32) {
-            ggml_backend_tensor_get(tok_embd, dst, byte_offset, n_embd * sizeof(float));
-        } else if (tok_embd->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> f16_buf(n_embd);
-            ggml_backend_tensor_get(tok_embd, f16_buf.data(), byte_offset, n_embd * sizeof(ggml_fp16_t));
-            for (int i = 0; i < n_embd; ++i) {
-                dst[i] = ggml_fp16_to_fp32(f16_buf[i]);
-            }
-        } else {
+        if (!read_tensor_row_as_float(tok_embd, token_id, n_embd, dst)) {
             fprintf(stderr, "TTS: Unsupported tok_embd type: %d\n", tok_embd->type);
             return -1;
         }

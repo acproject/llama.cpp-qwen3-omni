@@ -17,6 +17,7 @@ struct server_context_meta {
     bool has_inp_image;
     bool has_inp_audio;
     bool has_inp_video;
+    bool has_out_audio;
     json json_webui_settings;
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
@@ -96,6 +97,7 @@ struct server_routes {
     server_http_context::handler_t post_completions;
     server_http_context::handler_t post_completions_oai;
     server_http_context::handler_t post_chat_completions;
+    server_http_context::handler_t post_audio_speech;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;
@@ -123,7 +125,7 @@ private:
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    const server_context_impl & ctx_server;
+    server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;

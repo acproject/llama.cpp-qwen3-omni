@@ -5,6 +5,7 @@
 #include "server-queue.h"
 
 #include "arg.h"
+#include "base64.hpp"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -12,12 +13,15 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-tts.h"
 
 #include <cstddef>
 #include <cinttypes>
+#include <cstdint>
 #include <memory>
 #include <unordered_set>
 #include <filesystem>
+#include <mutex>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -65,6 +69,171 @@ static bool server_task_type_need_logits(server_task_type task_type) {
         default:
             return false;
     }
+}
+
+struct server_tts_request {
+    std::string text;
+    std::string response_format = "wav";
+    int speaker_id = 2301;
+};
+
+struct server_chat_speech_request {
+    std::string response_format = "wav";
+    int speaker_id = 2301;
+    std::string voice = "chelsie";
+};
+
+static std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    return value;
+}
+
+static int parse_qwen3omni_speaker_id(const json & body) {
+    if (!body.contains("voice")) {
+        return 2301;
+    }
+
+    const json & voice = body.at("voice");
+    if (voice.is_number_integer()) {
+        return voice.get<int>();
+    }
+
+    if (!voice.is_string()) {
+        throw std::invalid_argument("voice must be a string or integer");
+    }
+
+    const std::string value = lowercase(voice.get<std::string>());
+    if (value == "2301" || value == "chelsie") {
+        return 2301;
+    }
+    if (value == "2302" || value == "ethan") {
+        return 2302;
+    }
+    if (value == "2303" || value == "aiden") {
+        return 2303;
+    }
+
+    throw std::invalid_argument("unsupported voice, expected one of: chelsie, ethan, aiden, 2301, 2302, 2303");
+}
+
+static server_tts_request parse_tts_request(const json & body) {
+    if (!body.contains("input") || !body.at("input").is_string()) {
+        throw std::invalid_argument("'input' is required and must be a string");
+    }
+
+    server_tts_request req;
+    req.text = body.at("input").get<std::string>();
+    if (req.text.empty()) {
+        throw std::invalid_argument("'input' must not be empty");
+    }
+
+    req.response_format = lowercase(json_value(body, "response_format", std::string("wav")));
+    if (req.response_format != "wav") {
+        throw std::invalid_argument("response_format must be 'wav'");
+    }
+
+    req.speaker_id = parse_qwen3omni_speaker_id(body);
+    return req;
+}
+
+static std::optional<server_chat_speech_request> parse_chat_speech_request(const json & body) {
+    if (body.contains("speech")) {
+        const json & speech = body.at("speech");
+        if (!speech.is_object()) {
+            throw std::invalid_argument("speech must be an object");
+        }
+
+        server_chat_speech_request req;
+        req.response_format = lowercase(json_value(speech, "response_format", std::string("wav")));
+        if (req.response_format != "wav") {
+            throw std::invalid_argument("speech.response_format must be 'wav'");
+        }
+
+        const int speaker_id = parse_qwen3omni_speaker_id(speech);
+        req.speaker_id = speaker_id;
+        req.voice = speaker_id == 2302 ? "ethan" : speaker_id == 2303 ? "aiden" : "chelsie";
+        return req;
+    }
+
+    const json modalities = json_value(body, "modalities", json());
+    if (!modalities.is_array()) {
+        return std::nullopt;
+    }
+
+    bool wants_audio = false;
+    for (const auto & item : modalities) {
+        if (item.is_string() && lowercase(item.get<std::string>()) == "audio") {
+            wants_audio = true;
+            break;
+        }
+    }
+    if (!wants_audio) {
+        return std::nullopt;
+    }
+
+    const json & audio = body.contains("audio") ? body.at("audio") : json::object();
+    if (!audio.is_object()) {
+        throw std::invalid_argument("audio must be an object when modalities includes 'audio'");
+    }
+
+    server_chat_speech_request req;
+    req.response_format = lowercase(json_value(audio, "format", std::string("wav")));
+    if (req.response_format != "wav") {
+        throw std::invalid_argument("audio.format must be 'wav'");
+    }
+
+    const int speaker_id = parse_qwen3omni_speaker_id(audio);
+    req.speaker_id = speaker_id;
+    req.voice = speaker_id == 2302 ? "ethan" : speaker_id == 2303 ? "aiden" : "chelsie";
+    return req;
+}
+
+static std::string build_wav_audio(const float * samples, int n_samples, int sample_rate) {
+    std::string wav;
+    wav.reserve(44 + n_samples * (int) sizeof(int16_t));
+
+    auto append_bytes = [&wav](const auto & value) {
+        wav.append(reinterpret_cast<const char *>(&value), sizeof(value));
+    };
+
+    wav.append("RIFF", 4);
+    uint32_t file_size = 36 + n_samples * sizeof(int16_t);
+    append_bytes(file_size);
+    wav.append("WAVE", 4);
+    wav.append("fmt ", 4);
+    uint32_t fmt_size = 16;
+    append_bytes(fmt_size);
+    uint16_t audio_format = 1;
+    append_bytes(audio_format);
+    uint16_t num_channels = 1;
+    append_bytes(num_channels);
+    uint32_t sample_rate_u32 = sample_rate;
+    append_bytes(sample_rate_u32);
+    uint32_t byte_rate = sample_rate * sizeof(int16_t);
+    append_bytes(byte_rate);
+    uint16_t block_align = sizeof(int16_t);
+    append_bytes(block_align);
+    uint16_t bits_per_sample = 16;
+    append_bytes(bits_per_sample);
+    wav.append("data", 4);
+    uint32_t data_size = n_samples * sizeof(int16_t);
+    append_bytes(data_size);
+
+    for (int i = 0; i < n_samples; ++i) {
+        float s = samples[i];
+        if (s > 1.0f) {
+            s = 1.0f;
+        }
+        if (s < -1.0f) {
+            s = -1.0f;
+        }
+        int16_t sample = static_cast<int16_t>(s * 32767.0f);
+        append_bytes(sample);
+    }
+
+    return wav;
 }
 
 struct server_slot {
@@ -531,6 +700,41 @@ public:
         }
     }
 
+    bool supports_tts() const {
+        return tts_ctx != nullptr && ctx_tts != nullptr;
+    }
+
+    std::string synthesize_wav(const server_tts_request & req) {
+        if (!supports_tts()) {
+            throw std::runtime_error("audio output is not supported - start the server with --model-vocoder");
+        }
+
+        std::lock_guard<std::mutex> lock(tts_mutex);
+
+        const int max_samples = mtmd_tts_estimate_samples(500);
+        std::vector<float> samples(max_samples);
+
+        mtmd_tts_params tts_params = mtmd_tts_params_default();
+        tts_params.speaker_id = req.speaker_id;
+        mtmd_tts_free(tts_ctx);
+        tts_ctx = mtmd_tts_init(model, tts_model, tts_params);
+        if (tts_ctx == nullptr) {
+            throw std::runtime_error("failed to initialize TTS context");
+        }
+
+        const int n_samples = mtmd_tts_generate_from_text(
+            tts_ctx,
+            ctx_tts,
+            req.text.c_str(),
+            samples.data(),
+            max_samples);
+        if (n_samples <= 0) {
+            throw std::runtime_error("failed to generate speech");
+        }
+
+        return build_wav_audio(samples.data(), n_samples, tts_params.sample_rate);
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -542,10 +746,14 @@ private:
     common_init_result_ptr llama_init_dft;
 
     llama_context * ctx = nullptr;
+    llama_context * ctx_tts = nullptr;
 
     bool vocab_dft_compatible = true;
 
     llama_model * model_dft = nullptr;
+    llama_model * tts_model = nullptr;
+    mtmd_tts_context * tts_ctx = nullptr;
+    std::mutex tts_mutex;
 
     llama_context_params cparams_dft;
 
@@ -574,12 +782,23 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        if (tts_ctx) {
+            mtmd_tts_free(tts_ctx);
+            tts_ctx = nullptr;
+        }
+        if (ctx_tts) {
+            llama_free(ctx_tts);
+            ctx_tts = nullptr;
+        }
+        if (tts_model) {
+            llama_model_free(tts_model);
+            tts_model = nullptr;
+        }
+        mtmd_free(mctx);
+        mctx = nullptr;
         llama_init.reset();
         ctx = nullptr;
         model = nullptr;
-
-        mtmd_free(mctx);
-        mctx = nullptr;
 
         // Clear any sampling context
         for (server_slot & slot : slots) {
@@ -734,6 +953,42 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+
+        if (!params_base.vocoder.model.path.empty()) {
+            SRV_INF("loading vocoder model '%s'\n", params_base.vocoder.model.path.c_str());
+
+            llama_model_params tts_mparams = llama_model_default_params();
+            tts_mparams.n_gpu_layers = params_base.n_gpu_layers;
+            tts_model = llama_model_load_from_file(params_base.vocoder.model.path.c_str(), tts_mparams);
+            if (tts_model == nullptr) {
+                SRV_ERR("failed to load vocoder model, '%s'\n", params_base.vocoder.model.path.c_str());
+                return false;
+            }
+
+            if (!mtmd_tts_supported(tts_model)) {
+                SRV_ERR("%s\n", "vocoder model does not support Qwen3-Omni TTS");
+                return false;
+            }
+
+            mtmd_tts_params tts_params = mtmd_tts_params_default();
+            tts_ctx = mtmd_tts_init(model, tts_model, tts_params);
+            if (tts_ctx == nullptr) {
+                SRV_ERR("%s\n", "failed to initialize TTS context");
+                return false;
+            }
+
+            llama_context_params tts_cparams = common_context_params_to_llama(params_base);
+            const int n_ctx_tts = std::min(2048, llama_model_n_ctx_train(model));
+            tts_cparams.n_ctx = n_ctx_tts > 0 ? n_ctx_tts : 2048;
+            tts_cparams.n_batch = tts_cparams.n_ctx;
+            tts_cparams.n_ubatch = std::min(tts_cparams.n_ubatch, tts_cparams.n_batch);
+            tts_cparams.n_seq_max = 1;
+            ctx_tts = llama_init_from_model(model, tts_cparams);
+            if (ctx_tts == nullptr) {
+                SRV_ERR("%s\n", "failed to create TTS thinker context");
+                return false;
+            }
+        }
 
         // setup slots
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
@@ -2807,6 +3062,7 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_image          */ impl->oai_parser_opt.allow_image,
         /* has_inp_audio          */ impl->oai_parser_opt.allow_audio,
         /* has_inp_video          */ impl->oai_parser_opt.allow_video,
+        /* has_out_audio          */ impl->supports_tts(),
         /* json_webui_settings    */ impl->json_webui_settings,
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
         /* pooling_type           */ llama_pooling_type(impl->ctx),
@@ -2870,6 +3126,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
+    std::optional<server_chat_speech_request> chat_speech_req;
+
+    try {
+        chat_speech_req = parse_chat_speech_request(data);
+    } catch (const std::exception & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (chat_speech_req.has_value()) {
+        if (res_type != TASK_RESPONSE_TYPE_OAI_CHAT) {
+            res->error(format_error_response("speech is only supported for chat completions", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!meta->has_out_audio) {
+            res->error(format_error_response("audio output is not supported - start the server with --model-vocoder", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+    }
 
     try {
         std::vector<server_task> tasks;
@@ -2927,6 +3202,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     }
 
     bool stream = json_value(data, "stream", false);
+    if (chat_speech_req.has_value() && stream) {
+        res->error(format_error_response("speech in chat completions requires stream=false", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
 
     if (!stream) {
         // non-stream, wait for the results
@@ -2941,6 +3220,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             for (auto & res : all_results.results) {
                 GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
                 arr.push_back(res->to_json());
+            }
+            if (chat_speech_req.has_value()) {
+                for (auto & item : arr) {
+                    if (!item.contains("choices")) {
+                        continue;
+                    }
+                    for (auto & choice : item["choices"]) {
+                        if (!choice.contains("message")) {
+                            continue;
+                        }
+                        auto & message = choice["message"];
+                        const std::string content = json_value(message, "content", std::string());
+                        if (content.empty()) {
+                            continue;
+                        }
+                        server_tts_request tts_req;
+                        tts_req.text = content;
+                        tts_req.response_format = chat_speech_req->response_format;
+                        tts_req.speaker_id = chat_speech_req->speaker_id;
+                        const std::string wav = ctx_server.synthesize_wav(tts_req);
+                        message["audio"] = json {
+                            {"voice",  chat_speech_req->voice},
+                            {"format", chat_speech_req->response_format},
+                            {"data",   base64::encode(wav.data(), wav.size())},
+                        };
+                    }
+                }
             }
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
@@ -3290,6 +3596,7 @@ void server_routes::init_routes() {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
                 {"video",  meta->has_inp_video},
+                {"speech", meta->has_out_audio},
             } },
             { "endpoint_slots",              params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
@@ -3466,6 +3773,28 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT);
+    };
+
+    this->post_audio_speech = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!meta->has_out_audio) {
+            res->error(format_error_response("This server does not support audio speech endpoint. Start it with `--model-vocoder`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        try {
+            const server_tts_request tts_req = parse_tts_request(json::parse(req.body));
+            res->status = 200;
+            res->content_type = "audio/wav";
+            res->data = ctx_server.synthesize_wav(tts_req);
+            return res;
+        } catch (const std::invalid_argument & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+            return res;
+        }
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
