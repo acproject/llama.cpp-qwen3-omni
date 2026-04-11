@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -684,6 +685,19 @@ static std::string write_temp_media_file(const server_media & media) {
     return path;
 }
 
+static bool path_is_within_base(const std::filesystem::path & path, const std::filesystem::path & base) {
+    auto base_it = base.begin();
+    auto path_it = path.begin();
+
+    for (; base_it != base.end(); ++base_it, ++path_it) {
+        if (path_it == path.end() || *path_it != *base_it) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 #ifdef LLAMA_SERVER_FFMPEG
 namespace video_helpers {
 
@@ -1242,19 +1256,35 @@ static void handle_media(
         }
         // load local media file
         std::string file_path = url.substr(7); // remove "file://"
-        if (!fs_validate_filename(file_path, true)) {
+        std::string resolved_path;
+        if (std::filesystem::path(file_path).is_absolute()) {
+            std::error_code ec_base;
+            std::error_code ec_file;
+            const auto allowed_root = std::filesystem::weakly_canonical(std::filesystem::path(media_path), ec_base);
+            const auto requested_path = std::filesystem::weakly_canonical(std::filesystem::path(file_path), ec_file);
+            if (ec_base || ec_file || !path_is_within_base(requested_path, allowed_root)) {
+                throw std::invalid_argument("file path is not allowed: " + file_path);
+            }
+            resolved_path = requested_path.string();
+        } else if (fs_validate_filename(file_path, true)) {
+            resolved_path = media_path + file_path;
+        } else {
             throw std::invalid_argument("file path is not allowed: " + file_path);
         }
-        SRV_INF("loading media from local file '%s'\n", (media_path + file_path).c_str());
-        std::ifstream file(media_path + file_path, std::ios::binary);
-        if (!file) {
-            throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
-        }
+        SRV_INF("loading media from local file '%s'\n", resolved_path.c_str());
         server_media media;
         media.kind = kind;
         if (kind == server_media_kind::video_file) {
-            media.path = media_path + file_path;
+            std::error_code ec_exists;
+            if (!std::filesystem::is_regular_file(resolved_path, ec_exists) || ec_exists) {
+                throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
+            }
+            media.path = resolved_path;
         } else {
+            std::ifstream file(resolved_path, std::ios::binary);
+            if (!file) {
+                throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
+            }
             media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         }
         out_files.push_back(std::move(media));
