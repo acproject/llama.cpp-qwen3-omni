@@ -9,9 +9,25 @@
 
 #include "server-common.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <unistd.h>
+
+#ifdef LLAMA_SERVER_FFMPEG
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+}
+#include <cmath>
+#include <memory>
+#endif
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -644,11 +660,408 @@ static bool replace_first(std::string & text, const std::string & what, const st
     return true;
 }
 
+static std::string write_temp_media_file(const server_media & media) {
+    char path[] = "/tmp/llama-server-media-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to create temporary media file");
+    }
+
+    FILE * file = fdopen(fd, "wb");
+    if (file == nullptr) {
+        close(fd);
+        std::remove(path);
+        throw std::runtime_error("Failed to open temporary media file");
+    }
+
+    const size_t written = fwrite(media.data.data(), 1, media.data.size(), file);
+    fclose(file);
+    if (written != media.data.size()) {
+        std::remove(path);
+        throw std::runtime_error("Failed to write temporary media file");
+    }
+
+    return path;
+}
+
+#ifdef LLAMA_SERVER_FFMPEG
+namespace video_helpers {
+
+struct avformat_input_deleter {
+    void operator()(AVFormatContext * ctx) const {
+        if (ctx != nullptr) {
+            avformat_close_input(&ctx);
+        }
+    }
+};
+
+struct avcodec_context_deleter {
+    void operator()(AVCodecContext * ctx) const {
+        avcodec_free_context(&ctx);
+    }
+};
+
+struct avframe_deleter {
+    void operator()(AVFrame * frame) const {
+        av_frame_free(&frame);
+    }
+};
+
+struct avpacket_deleter {
+    void operator()(AVPacket * packet) const {
+        av_packet_free(&packet);
+    }
+};
+
+struct swscale_context_deleter {
+    void operator()(SwsContext * ctx) const {
+        sws_freeContext(ctx);
+    }
+};
+
+struct swresample_context_deleter {
+    void operator()(SwrContext * ctx) const {
+        swr_free(&ctx);
+    }
+};
+
+using avformat_input_ptr = std::unique_ptr<AVFormatContext, avformat_input_deleter>;
+using avcodec_context_ptr = std::unique_ptr<AVCodecContext, avcodec_context_deleter>;
+using avframe_ptr = std::unique_ptr<AVFrame, avframe_deleter>;
+using avpacket_ptr = std::unique_ptr<AVPacket, avpacket_deleter>;
+using swscale_context_ptr = std::unique_ptr<SwsContext, swscale_context_deleter>;
+using swresample_context_ptr = std::unique_ptr<SwrContext, swresample_context_deleter>;
+
+static double stream_duration_seconds(const AVFormatContext * fmt_ctx, const AVStream * stream) {
+    if (stream->duration > 0) {
+        return stream->duration * av_q2d(stream->time_base);
+    }
+    if (fmt_ctx->duration > 0) {
+        return fmt_ctx->duration / (double) AV_TIME_BASE;
+    }
+    return 0.0;
+}
+
+static double frame_timestamp_seconds(const AVFrame * frame, const AVStream * stream, int64_t decoded_index) {
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        return frame->best_effort_timestamp * av_q2d(stream->time_base);
+    }
+    AVRational fps = stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+    if (fps.num > 0 && fps.den > 0) {
+        return decoded_index / av_q2d(fps);
+    }
+    return (double) decoded_index;
+}
+
+static bool add_rgb_frame(mtmd::bitmaps & bitmaps, SwsContext * sws_ctx, AVFrame * src_frame, const std::string & fname, size_t frame_idx) {
+    const int width = src_frame->width;
+    const int height = src_frame->height;
+    const int rgb_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, width, height, 1);
+    if (rgb_buf_size <= 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> rgb_buf(rgb_buf_size);
+    uint8_t * dst_data[4] = { nullptr, nullptr, nullptr, nullptr };
+    int dst_linesize[4] = { 0, 0, 0, 0 };
+    if (av_image_fill_arrays(dst_data, dst_linesize, rgb_buf.data(), AV_PIX_FMT_RGB24, width, height, 1) < 0) {
+        return false;
+    }
+
+    if (sws_scale(sws_ctx, src_frame->data, src_frame->linesize, 0, height, dst_data, dst_linesize) <= 0) {
+        return false;
+    }
+
+    mtmd::bitmap bmp(width, height, rgb_buf.data());
+    bmp.set_id((fname + "#frame-" + std::to_string(frame_idx)).c_str());
+    bitmaps.entries.push_back(std::move(bmp));
+    return true;
+}
+
+static size_t decode_video_frames(const std::string & fname, mtmd::bitmaps & bitmaps) {
+    AVFormatContext * raw_fmt_ctx = nullptr;
+    if (avformat_open_input(&raw_fmt_ctx, fname.c_str(), nullptr, nullptr) < 0) {
+        return 0;
+    }
+    avformat_input_ptr fmt_ctx(raw_fmt_ctx);
+    if (avformat_find_stream_info(fmt_ctx.get(), nullptr) < 0) {
+        return 0;
+    }
+
+    const int video_stream_idx = av_find_best_stream(fmt_ctx.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (video_stream_idx < 0) {
+        return 0;
+    }
+
+    AVStream * stream = fmt_ctx->streams[video_stream_idx];
+    const AVCodec * codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (codec == nullptr) {
+        return 0;
+    }
+
+    avcodec_context_ptr codec_ctx(avcodec_alloc_context3(codec));
+    if (!codec_ctx) {
+        return 0;
+    }
+    if (avcodec_parameters_to_context(codec_ctx.get(), stream->codecpar) < 0) {
+        return 0;
+    }
+    if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
+        return 0;
+    }
+
+    swscale_context_ptr sws_ctx(sws_getContext(
+        codec_ctx->width,
+        codec_ctx->height,
+        codec_ctx->pix_fmt,
+        codec_ctx->width,
+        codec_ctx->height,
+        AV_PIX_FMT_RGB24,
+        SWS_BILINEAR,
+        nullptr,
+        nullptr,
+        nullptr));
+    if (!sws_ctx) {
+        return 0;
+    }
+
+    const double duration_sec = stream_duration_seconds(fmt_ctx.get(), stream);
+    const size_t max_frames = 8;
+    size_t target_frames = 1;
+    if (duration_sec > 0.0) {
+        target_frames = std::max<size_t>(1, std::min<size_t>(max_frames, (size_t) std::llround(duration_sec)));
+    }
+    const double sample_interval = target_frames > 1 ? duration_sec / (double) (target_frames - 1) : 0.0;
+    double next_sample = sample_interval;
+
+    avpacket_ptr packet(av_packet_alloc());
+    avframe_ptr frame(av_frame_alloc());
+    if (!packet || !frame) {
+        return 0;
+    }
+
+    size_t loaded = 0;
+    int64_t decoded_index = 0;
+
+    auto handle_frame = [&](AVFrame * cur_frame) {
+        const double ts_sec = frame_timestamp_seconds(cur_frame, stream, decoded_index++);
+        const bool should_take = loaded == 0 || sample_interval <= 0.0 || ts_sec + 1e-6 >= next_sample;
+        if (!should_take) {
+            return true;
+        }
+        if (!add_rgb_frame(bitmaps, sws_ctx.get(), cur_frame, fname, loaded)) {
+            return false;
+        }
+        ++loaded;
+        if (sample_interval > 0.0) {
+            next_sample += sample_interval;
+        }
+        return loaded < target_frames;
+    };
+
+    while (av_read_frame(fmt_ctx.get(), packet.get()) >= 0) {
+        if (packet->stream_index != video_stream_idx) {
+            av_packet_unref(packet.get());
+            continue;
+        }
+        if (avcodec_send_packet(codec_ctx.get(), packet.get()) < 0) {
+            av_packet_unref(packet.get());
+            return loaded;
+        }
+        av_packet_unref(packet.get());
+        while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+            if (!handle_frame(frame.get())) {
+                return loaded;
+            }
+            av_frame_unref(frame.get());
+        }
+    }
+
+    avcodec_send_packet(codec_ctx.get(), nullptr);
+    while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+        if (!handle_frame(frame.get())) {
+            break;
+        }
+        av_frame_unref(frame.get());
+    }
+
+    return loaded;
+}
+
+static bool decode_audio_samples(const std::string & fname, int sample_rate, std::vector<float> & pcmf32) {
+    AVFormatContext * raw_fmt_ctx = nullptr;
+    if (avformat_open_input(&raw_fmt_ctx, fname.c_str(), nullptr, nullptr) < 0) {
+        return false;
+    }
+    avformat_input_ptr fmt_ctx(raw_fmt_ctx);
+    if (avformat_find_stream_info(fmt_ctx.get(), nullptr) < 0) {
+        return false;
+    }
+
+    const int audio_stream_idx = av_find_best_stream(fmt_ctx.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audio_stream_idx < 0) {
+        return false;
+    }
+
+    AVStream * stream = fmt_ctx->streams[audio_stream_idx];
+    const AVCodec * codec = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (codec == nullptr) {
+        return false;
+    }
+
+    avcodec_context_ptr codec_ctx(avcodec_alloc_context3(codec));
+    if (!codec_ctx) {
+        return false;
+    }
+    if (avcodec_parameters_to_context(codec_ctx.get(), stream->codecpar) < 0) {
+        return false;
+    }
+    if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
+        return false;
+    }
+
+    AVChannelLayout out_layout;
+    av_channel_layout_default(&out_layout, 1);
+    SwrContext * raw_swr_ctx = nullptr;
+    if (swr_alloc_set_opts2(
+            &raw_swr_ctx,
+            &out_layout,
+            AV_SAMPLE_FMT_FLT,
+            sample_rate,
+            &codec_ctx->ch_layout,
+            codec_ctx->sample_fmt,
+            codec_ctx->sample_rate,
+            0,
+            nullptr) < 0) {
+        av_channel_layout_uninit(&out_layout);
+        return false;
+    }
+    swresample_context_ptr swr_ctx(raw_swr_ctx);
+    av_channel_layout_uninit(&out_layout);
+    if (!swr_ctx || swr_init(swr_ctx.get()) < 0) {
+        return false;
+    }
+
+    avpacket_ptr packet(av_packet_alloc());
+    avframe_ptr frame(av_frame_alloc());
+    if (!packet || !frame) {
+        return false;
+    }
+
+    auto append_frame = [&](AVFrame * cur_frame) {
+        const int dst_nb_samples = av_rescale_rnd(
+            swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate) + cur_frame->nb_samples,
+            sample_rate,
+            codec_ctx->sample_rate,
+            AV_ROUND_UP);
+        std::vector<float> buffer(dst_nb_samples);
+        std::vector<const uint8_t *> input(cur_frame->ch_layout.nb_channels);
+        for (int i = 0; i < cur_frame->ch_layout.nb_channels; ++i) {
+            input[i] = cur_frame->extended_data[i];
+        }
+        uint8_t * out[] = { reinterpret_cast<uint8_t *>(buffer.data()) };
+        const int out_samples = swr_convert(
+            swr_ctx.get(),
+            out,
+            dst_nb_samples,
+            input.data(),
+            cur_frame->nb_samples);
+        if (out_samples > 0) {
+            pcmf32.insert(pcmf32.end(), buffer.begin(), buffer.begin() + out_samples);
+        }
+        return out_samples >= 0;
+    };
+
+    while (av_read_frame(fmt_ctx.get(), packet.get()) >= 0) {
+        if (packet->stream_index != audio_stream_idx) {
+            av_packet_unref(packet.get());
+            continue;
+        }
+        if (avcodec_send_packet(codec_ctx.get(), packet.get()) < 0) {
+            av_packet_unref(packet.get());
+            return !pcmf32.empty();
+        }
+        av_packet_unref(packet.get());
+        while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+            if (!append_frame(frame.get())) {
+                return !pcmf32.empty();
+            }
+            av_frame_unref(frame.get());
+        }
+    }
+
+    avcodec_send_packet(codec_ctx.get(), nullptr);
+    while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+        if (!append_frame(frame.get())) {
+            return !pcmf32.empty();
+        }
+        av_frame_unref(frame.get());
+    }
+
+    if (swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate) > 0) {
+        const int dst_nb_samples = av_rescale_rnd(
+            swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate),
+            sample_rate,
+            codec_ctx->sample_rate,
+            AV_ROUND_UP);
+        std::vector<float> buffer(dst_nb_samples);
+        uint8_t * out[] = { reinterpret_cast<uint8_t *>(buffer.data()) };
+        const int out_samples = swr_convert(swr_ctx.get(), out, dst_nb_samples, nullptr, 0);
+        if (out_samples > 0) {
+            pcmf32.insert(pcmf32.end(), buffer.begin(), buffer.begin() + out_samples);
+        }
+    }
+
+    return !pcmf32.empty();
+}
+
+static size_t append_video_file(mtmd_context * ctx, const std::string & fname, mtmd::bitmaps & out) {
+    size_t loaded = 0;
+    if (mtmd_support_vision(ctx)) {
+        loaded += decode_video_frames(fname, out);
+    }
+    if (mtmd_support_audio(ctx)) {
+        const int sample_rate = mtmd_get_audio_bitrate(ctx);
+        const int chunk_len = mtmd_get_audio_chunk_len(ctx);
+        if (sample_rate > 0) {
+            std::vector<float> pcmf32;
+            if (decode_audio_samples(fname, sample_rate, pcmf32)) {
+                if (chunk_len > 0) {
+                    const size_t max_samples = (size_t) sample_rate * (size_t) chunk_len;
+                    if (pcmf32.size() > max_samples) {
+                        pcmf32.resize(max_samples);
+                    }
+                }
+                mtmd::bitmap bmp(mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data()));
+                if (bmp.ptr) {
+                    bmp.set_id((fname + "#audio").c_str());
+                    out.entries.push_back(std::move(bmp));
+                    ++loaded;
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
+} // namespace video_helpers
+#endif
+
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<server_media> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
         if (file.kind == server_media_kind::video_file) {
-            const size_t n_loaded = mtmd::helper_bitmaps_append_from_file(mctx, file.path.c_str(), bitmaps);
+            const bool use_temp_file = file.path.empty();
+            const std::string media_path = use_temp_file ? write_temp_media_file(file) : file.path;
+            size_t n_loaded = 0;
+#ifdef LLAMA_SERVER_FFMPEG
+            n_loaded = video_helpers::append_video_file(mctx, media_path, bitmaps);
+#else
+            throw std::runtime_error("Video input requires a llama-server build with FFmpeg support");
+#endif
+            if (use_temp_file) {
+                std::remove(media_path.c_str());
+            }
             if (n_loaded == 0) {
                 throw std::runtime_error("Failed to load video file");
             }
@@ -801,7 +1214,8 @@ json oaicompat_completion_params_parse(const json & body) {
 static void handle_media(
         std::vector<server_media> & out_files,
         json & media_obj,
-        const std::string & media_path) {
+        const std::string & media_path,
+        server_media_kind kind = server_media_kind::auto_detect) {
     std::string url = json_value(media_obj, "url", std::string());
     if (string_starts_with(url, "http")) {
         // download remote image
@@ -810,48 +1224,61 @@ static void handle_media(
         params.headers.push_back("User-Agent: llama.cpp/" + build_info);
         params.max_size = 1024 * 1024 * 10; // 10MB
         params.timeout  = 10; // seconds
-        SRV_INF("downloading image from '%s'\n", url.c_str());
+        SRV_INF("downloading media from '%s'\n", url.c_str());
         auto res = common_remote_get_content(url, params);
         if (200 <= res.first && res.first < 300) {
             SRV_INF("downloaded %zu bytes\n", res.second.size());
             server_media media;
+            media.kind = kind;
             media.data.insert(media.data.end(), res.second.begin(), res.second.end());
             out_files.push_back(std::move(media));
         } else {
-            throw std::runtime_error("Failed to download image");
+            throw std::runtime_error("Failed to download media");
         }
 
     } else if (string_starts_with(url, "file://")) {
         if (media_path.empty()) {
             throw std::invalid_argument("file:// URLs are not allowed unless --media-path is specified");
         }
-        // load local image file
+        // load local media file
         std::string file_path = url.substr(7); // remove "file://"
         if (!fs_validate_filename(file_path, true)) {
             throw std::invalid_argument("file path is not allowed: " + file_path);
         }
-        SRV_INF("loading image from local file '%s'\n", (media_path + file_path).c_str());
+        SRV_INF("loading media from local file '%s'\n", (media_path + file_path).c_str());
         std::ifstream file(media_path + file_path, std::ios::binary);
         if (!file) {
             throw std::invalid_argument("file does not exist or cannot be opened: " + file_path);
         }
         server_media media;
-        media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        media.kind = kind;
+        if (kind == server_media_kind::video_file) {
+            media.path = media_path + file_path;
+        } else {
+            media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        }
         out_files.push_back(std::move(media));
 
     } else {
-        // try to decode base64 image
+        // try to decode base64 media
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid url value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
-            throw std::runtime_error("Invalid url format: " + parts[0]);
         } else if (!string_ends_with(parts[0], "base64")) {
             throw std::runtime_error("url must be base64 encoded");
         } else {
+            const bool is_image = string_starts_with(parts[0], "data:image/");
+            const bool is_video = string_starts_with(parts[0], "data:video/");
+            if (kind == server_media_kind::video_file && !is_video) {
+                throw std::runtime_error("Invalid url format: " + parts[0]);
+            }
+            if (kind == server_media_kind::auto_detect && !is_image) {
+                throw std::runtime_error("Invalid url format: " + parts[0]);
+            }
             auto base64_data = parts[1];
             auto decoded_data = base64_decode(base64_data);
             server_media media;
+            media.kind = kind;
             media.data = std::move(decoded_data);
             out_files.push_back(std::move(media));
         }
@@ -862,7 +1289,7 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const oaicompat_parser_options & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<server_media> & out_files)
 {
     json llama_params;
 
@@ -952,6 +1379,18 @@ json oaicompat_chat_params_parse(
                 p["text"] = mtmd_default_marker();
                 p.erase("image_url");
 
+            } else if (type == "video_url") {
+                if (!opt.allow_video) {
+                    throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                }
+
+                json video_url = json_value(p, "video_url", json::object());
+                handle_media(out_files, video_url, opt.media_path, server_media_kind::video_file);
+
+                p["type"] = "text";
+                p["text"] = mtmd_video_marker_placeholder;
+                p.erase("video_url");
+
             } else if (type == "input_audio") {
                 if (!opt.allow_audio) {
                     throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
@@ -965,7 +1404,9 @@ json oaicompat_chat_params_parse(
                     throw std::invalid_argument("input_audio.format must be either 'wav' or 'mp3'");
                 }
                 auto decoded_data = base64_decode(data); // expected to be base64 encoded
-                out_files.push_back(decoded_data);
+                server_media media;
+                media.data = std::move(decoded_data);
+                out_files.push_back(std::move(media));
 
                 // TODO: add audio_url support by reusing handle_media()
 

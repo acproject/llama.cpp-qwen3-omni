@@ -50,7 +50,7 @@ static void signal_handler(int) {
 struct cli_context {
     server_context ctx_server;
     json messages = json::array();
-    std::vector<raw_buffer> input_files;
+    std::vector<server_media> input_files;
     task_params defaults;
 
     // thread for showing "loading" animation
@@ -147,9 +147,9 @@ struct cli_context {
             return "";
         }
         if (is_media) {
-            raw_buffer buf;
-            buf.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-            input_files.push_back(std::move(buf));
+            server_media media;
+            media.data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            input_files.push_back(std::move(media));
             return mtmd_default_marker();
         } else {
             std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());

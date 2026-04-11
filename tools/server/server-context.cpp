@@ -2806,6 +2806,7 @@ server_context_meta server_context::get_meta() const {
         /* has_mtmd               */ impl->mctx != nullptr,
         /* has_inp_image          */ impl->oai_parser_opt.allow_image,
         /* has_inp_audio          */ impl->oai_parser_opt.allow_audio,
+        /* has_inp_video          */ impl->oai_parser_opt.allow_video,
         /* json_webui_settings    */ impl->json_webui_settings,
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
         /* pooling_type           */ llama_pooling_type(impl->ctx),
@@ -2862,7 +2863,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
             const json & data,
-            const std::vector<raw_buffer> & files,
+            const std::vector<server_media> & files,
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
@@ -3288,6 +3289,7 @@ void server_routes::init_routes() {
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
+                {"video",  meta->has_inp_video},
             } },
             { "endpoint_slots",              params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
@@ -3417,7 +3419,7 @@ void server_routes::init_routes() {
             tokenized_prompts[0].get_text_tokens() // TODO: this could maybe be multimodal.
         );
 
-        std::vector<raw_buffer> files; // dummy
+        std::vector<server_media> files; // dummy
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_INFILL,
@@ -3428,7 +3430,7 @@ void server_routes::init_routes() {
 
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files; // dummy
+        std::vector<server_media> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
             req,
@@ -3440,7 +3442,7 @@ void server_routes::init_routes() {
 
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files; // dummy
+        std::vector<server_media> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
             req,
@@ -3452,7 +3454,7 @@ void server_routes::init_routes() {
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files;
+        std::vector<server_media> files;
         json body = json::parse(req.body);
         json body_parsed = oaicompat_chat_params_parse(
             body,
@@ -3468,7 +3470,7 @@ void server_routes::init_routes() {
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files;
+        std::vector<server_media> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
         json body_parsed = oaicompat_chat_params_parse(
             body,
@@ -3484,7 +3486,7 @@ void server_routes::init_routes() {
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files;
+        std::vector<server_media> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
         json body_parsed = oaicompat_chat_params_parse(
             body,
@@ -3500,7 +3502,7 @@ void server_routes::init_routes() {
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
-        std::vector<raw_buffer> files; // dummy, unused
+        std::vector<server_media> files; // dummy, unused
         json body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(
             body,

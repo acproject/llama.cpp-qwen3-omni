@@ -126,7 +126,7 @@ struct server_task {
 
     // only used by CLI, this delegates the tokenization to the server
     json                    cli_input = nullptr;
-    std::vector<raw_buffer> cli_files;
+    std::vector<server_media> cli_files;
 
     server_task_type type;
 

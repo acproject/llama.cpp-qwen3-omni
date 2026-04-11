@@ -22,6 +22,19 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC common mtmd ${CMAKE_THREAD_LIBS_INIT})
+find_package(PkgConfig QUIET)
+if (PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+        libavformat
+        libavcodec
+        libavutil
+        libswscale
+        libswresample)
+    if (TARGET PkgConfig::FFMPEG)
+        target_link_libraries(${TARGET} PUBLIC PkgConfig::FFMPEG)
+        target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_FFMPEG)
+    endif()
+endif()
 
 
 # llama-server executable
@@ -70,6 +83,10 @@ install(TARGETS ${TARGET} RUNTIME)
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+if (TARGET PkgConfig::FFMPEG)
+    target_link_libraries(${TARGET} PRIVATE PkgConfig::FFMPEG)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_FFMPEG)
+endif()
 
 if (WIN32)
     TARGET_LINK_LIBRARIES(${TARGET} PRIVATE ws2_32)

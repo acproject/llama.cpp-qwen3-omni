@@ -16,6 +16,7 @@ struct server_context_meta {
     bool has_mtmd;
     bool has_inp_image;
     bool has_inp_audio;
+    bool has_inp_video;
     json json_webui_settings;
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
@@ -111,7 +112,7 @@ private:
             const server_http_req & req,
             server_task_type type,
             const json & data,
-            const std::vector<raw_buffer> & files,
+            const std::vector<server_media> & files,
             task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
